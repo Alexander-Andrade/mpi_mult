@@ -11,7 +11,8 @@
 using namespace std;
 
 //random engine
-std::default_random_engine randGen((unsigned int)time(NULL));
+//std::default_random_engine randGen((unsigned int)time(NULL));
+std::default_random_engine randGen;
 std::uniform_real_distribution<float> unifDistr(0.0, 1.0);
 
 const int width = 4;
@@ -214,13 +215,16 @@ struct Mat {
 
 void sendMat(float* ptr, MatInfo& matInfo, MPI_Datatype matInfo_t, int src, int tag, MPI_Comm comm){
 	MPI_Send(&matInfo, 1,  matInfo_t, src, tag, comm);
+	//MPI_Send(&matInfo.height, 1,  MPI_INT, src, tag, comm);
+	//MPI_Send(&matInfo.width, 1,  MPI_INT, src, tag, comm);
 	MPI_Send(ptr, matInfo.width * matInfo.height, MPI_FLOAT, src, tag, comm);
 }
 
-Mat<float> recvMat(int source, int tag, MPI_Comm comm, MPI_Datatype matInfo_t){
+Mat<float> recvMat(int source, int tag, MPI_Comm comm, MPI_Datatype matInfo_t, MPI_Status& status){
 	MatInfo matInfo;
-	MPI_Status status;
 	MPI_Recv(&matInfo, 1, matInfo_t, source, tag, comm, &status);
+	//MPI_Recv(&matInfo.height, 1, MPI_INT, source, tag, comm, &status);
+	//MPI_Recv(&matInfo.width, 1, MPI_INT, source, tag, comm, &status);
 	Mat<float> mat(matInfo.height, matInfo.width);
 	MPI_Recv(mat.ptr, mat.height * mat.width, MPI_FLOAT,  source, tag, comm, &status);
 	return mat;
@@ -231,14 +235,16 @@ Mat<float> ribbonBlockingMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper& mp
 		int procCount = mpiWrap.getProcCount();
 		Mat<float> resMat;
 		Mat<float> trMat2;
+		MPI_Status status;
 		if(mpiWrap.isMaster()){
+			//devide and send mat1
 			trMat2 = mat2.transpose();
 
 			partHeight = mat1.height / procCount;
 			int heightResidue = mat1.height % mpiWrap.getProcCount();
 			int partCount = partHeight * mat1.width;
 
-			int ptrOffset = 0;
+			int ptrOffset = partCount;
 
 			MatInfo mat1Info(partHeight, mat1.width);
 			MatInfo mat2Info(trMat2.height, trMat2.width);
@@ -256,12 +262,12 @@ Mat<float> ribbonBlockingMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper& mp
 			}
 		}
 		else{
-			mat1 = recvMat(mpiWrap.MASTER, 0, MPI_COMM_WORLD, mpiWrap.getMatInfo_t());
-			trMat2 = recvMat(mpiWrap.MASTER, 0, MPI_COMM_WORLD, mpiWrap.getMatInfo_t());
+			//get mat1 part
+			mat1 = recvMat(mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t(), status);
+			trMat2 = recvMat(mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t(), status);
 			partHeight = mat1.height;
-			//cout <<"rank : "<< mpiWrap.getRank() << " " << mat1 << endl <<mat2 << endl;
 		}
-		//directly multiplication
+		//every node multiply
 		Mat<float> partResMat(partHeight, width);
 		int trHeight = trMat2.height;
 		int width = mat1.width; 
@@ -270,8 +276,10 @@ Mat<float> ribbonBlockingMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper& mp
 		float* mat1Row = mat1.ptr;
 		int i_offs = 0;
 		for(int i = 0;i < partHeight;i++){
+			tr2Row = trMat2.ptr;
 			for(int k = 0;k < trHeight;k++){
 				partResRow[k] = 0;
+				tr2Row = trMat2.ptr + k * width;
 				for(int j = 0;j < width;j++)
 					partResRow[k] += mat1Row[j] * tr2Row[j];
 				tr2Row += width;
@@ -282,15 +290,10 @@ Mat<float> ribbonBlockingMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper& mp
 		if(mpiWrap.isMaster()){
 			//gather results
 			resMat = Mat<float>(mat1.height, mat2.width);
-			float* slidePtr = resMat.ptr;
-			int partMatSize = partResMat.height * partResMat.width;
-			memcpy(slidePtr, partResMat.ptr, sizeof(float) * partMatSize);
-			slidePtr += partMatSize;
+			memcpy(resMat.ptr, partResMat.ptr, sizeof(float) * partResMat.height * partResMat.width);
 			for(int i = 1; i < procCount;i++){
-				partResMat = recvMat(MPI_ANY_SOURCE , 0, MPI_COMM_WORLD, mpiWrap.getMatInfo_t());
-				partMatSize = partResMat.height * partResMat.width;
-				memcpy(slidePtr, partResMat.ptr, sizeof(float) * partMatSize);
-				slidePtr += partMatSize;
+				partResMat = recvMat(MPI_ANY_SOURCE , MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t(), status);
+				memcpy(resMat.ptr + status.MPI_SOURCE * partHeight * partResMat.width, partResMat.ptr, sizeof(float) *  partResMat.height * partResMat.width);
 			}
 			cout <<"result mat : "<< resMat << endl;
 		}else{
