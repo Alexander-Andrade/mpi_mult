@@ -115,7 +115,7 @@ public:
 				row[j] = mrow[j];
 		}
 	}
-
+	bool empty(){return width == 0 || height == 0  || ptr == nullptr;}
 	size_t getWidth()const{return width;}
 	size_t getHeight()const{return height;}
 	size_t getCount()const{return width * height;}
@@ -392,6 +392,68 @@ Mat<float> ribbonNonBlockingMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper&
 		return resMat;
 	}
 
+Mat<float> ribbonCollectiveMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper& mpiWrap){
+		int procCount = mpiWrap.getProcCount();
+		Mat<float> resMat;
+		Mat<float> trMat2;
+		MatInfo mat1Info;
+		MatInfo mat2Info;
+		int partCount = 0;
+		if(mpiWrap.isMaster()){
+			//devide and send mat1
+			trMat2 = mat2.transpose();
+
+			int partHeight = mat1.getHeight() / procCount;
+			int heightResidue = mat1.getHeight() % mpiWrap.getProcCount();
+			partCount = partHeight * mat1.getWidth();
+
+			mat1Info.height = partHeight;
+			mat1Info.width = mat1.getWidth();
+
+			mat2Info.height =  trMat2.getHeight();
+			mat2Info.width =  trMat2.getWidth();
+		}
+		//bcast transposed mat
+		MPI_Bcast(& mat2Info, 1, mpiWrap.getMatInfo_t(), mpiWrap.MASTER, MPI_COMM_WORLD);
+		if( ! mpiWrap.isMaster())
+			trMat2 = Mat<float>(mat2Info.height, mat2Info.width);
+		MPI_Bcast(trMat2.getPtr() , trMat2.getCount(),MPI_FLOAT, mpiWrap.MASTER, MPI_COMM_WORLD);
+		
+		
+		MPI_Bcast(& mat1Info, 1, mpiWrap.getMatInfo_t(), mpiWrap.MASTER, MPI_COMM_WORLD);
+		if(! mpiWrap.isMaster())
+			mat1 = Mat<float>(mat1Info.height, mat1Info.width);
+		if(mpiWrap.isMaster())
+			MPI_Scatter(mat1.getPtr(), mat1Info.height * mat1Info.width, MPI_FLOAT, MPI_IN_PLACE, mat1Info.height * mat1Info.width, MPI_FLOAT, mpiWrap.MASTER, MPI_COMM_WORLD);
+		else
+			MPI_Scatter(NULL, mat1Info.height * mat1Info.width, MPI_FLOAT,mat1.getPtr(), mat1Info.height * mat1Info.width, MPI_FLOAT, mpiWrap.MASTER, MPI_COMM_WORLD);
+	//every node multiply his part
+		int partHeight = mat1Info.height;
+		Mat<float> partResMat(partHeight, trMat2.getHeight());
+		int trHeight = trMat2.getHeight();
+		int width = mat1.getWidth(); 
+		float* partResRow = partResMat.getPtr();  
+		float* tr2Row = trMat2.getPtr();
+		float* mat1Row = mat1.getPtr();
+		for(int i = 0;i < partHeight;i++){
+			tr2Row = trMat2.getPtr();
+			for(int k = 0;k < trHeight;k++){
+				partResRow[k] = 0;
+				for(int j = 0;j < width;j++)
+					partResRow[k] += mat1Row[j] * tr2Row[j];
+				tr2Row += width;
+			}
+			partResRow += partResMat.getWidth();
+			mat1Row += width;
+		}
+		
+		if(mpiWrap.isMaster())
+			resMat = Mat<float>(mat1.getHeight(), mat2.getWidth());
+		MPI_Gather(partResMat.getPtr(), partResMat.getCount(), MPI_FLOAT, resMat.getPtr(), partResMat.getCount(), MPI_FLOAT, mpiWrap.MASTER, MPI_COMM_WORLD);  
+
+		return resMat;
+	}
+
 int main(int argc, char* argv[]){
 	MPI_Wrapper mpiWrap(&argc, &argv);
 	Mat<float> mat1;
@@ -412,52 +474,27 @@ int main(int argc, char* argv[]){
 		
 		timer.start();
 	}
-	/*
-	if(mpiWrap.isMaster()){
-		MatInfo mi(mat1.getHeight(), mat1.getWidth());
-		for(int i = 1; i< mpiWrap.getProcCount();i++){
-			MPI_Status stat[2];
-			MPI_Request req[2];
-			int fl = 0;
-			MPI_Isend(& mi, 1, mpiWrap.getMatInfo_t(), i, 0, MPI_COMM_WORLD, &req[0]); 
-			MPI_Isend(mat1.getPtr(), mat1.getCount(), MPI_FLOAT, i, 0, MPI_COMM_WORLD, &req[1]);
-			//MPI_Waitall( 2, req, stat); 
-			//MPI_Wait(&req[0], &stat[0]);
-			cout << "after";
-		}
-	}
-	else{
-		MPI_Status stat[2];
-		MPI_Request req[2];
-		MatInfo mi;
-		MPI_Irecv(&mi, 1, mpiWrap.getMatInfo_t(), mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD,& req[0]); 
-		MPI_Wait(&req[0], &stat[0]);
-		Mat<float> mat(mi.height, mi.width);
-		cout << mat.getWidth() <<" "<< mat.getHeight() << endl;
-		MPI_Irecv(mat.getPtr(), mat.getCount(), MPI_FLOAT, mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD,& req[1]);
-		MPI_Wait(&req[1], &stat[1]);
-		//MPI_Waitall( 2, req,stat); 
-		cout << "after ch";
-	}
-	*/
-	/*
 	
 	ribbonBlockingMul(mat1, mat2, mpiWrap);
 	
 	if(mpiWrap.isMaster()){
-		cout<<"mpi mult (" << m <<", " << n <<")" << "x" << "(" << n <<", "<<q <<") : " << timer.time_diff() << endl;
-		
+		cout<<"mpi blocking mult (" << m <<", " << n <<")" << "x" << "(" << n <<", "<<q <<") : " << timer.time_diff() << endl;
 		timer.start();
 	}
-	*/
 	
 	ribbonNonBlockingMul(mat1, mat2, mpiWrap);
 
 	if(mpiWrap.isMaster()){
-		cout<<"mpi async mult (" << m <<", " << n <<")" << "x" << "(" << n <<", "<<q <<") : " << timer.time_diff() << endl;
+		cout<<"mpi non-blocking mult (" << m <<", " << n <<")" << "x" << "(" << n <<", "<<q <<") : " << timer.time_diff() << endl;
+		timer.start();
+	}
+
+	ribbonCollectiveMul(mat1, mat2, mpiWrap);
+
+	if(mpiWrap.isMaster()){
+		cout<<"mpi collective mult (" << m <<", " << n <<")" << "x" << "(" << n <<", "<<q <<") : " << timer.time_diff() << endl;
 	}
 	
-
 	cout << endl;
 	system("pause");	
 }
