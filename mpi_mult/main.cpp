@@ -21,31 +21,12 @@ const int m = 512;
 const int n = 64;
 const int q = 128;
 
-class MPI_Exception : public exception{
-	string e;
-public:
-	MPI_Exception(const char* e){
-		this->e = "MPI Error : ";
-		this->e.append(e);
-	}
-	MPI_Exception(int errCode){
-		char errorStr[MPI_MAX_ERROR_STRING];
-		int errSize = 0;
-		MPI_Error_string(errCode, errorStr, &errSize);
-		e.append(errorStr, errorStr + errSize);
-	}
-	virtual const char* what()const throw(){
-		return this->e.data();
-	}
-};
-
 struct MatInfo{
 	int width;
 	int height;
 	MatInfo() : height(0), width(0) {}
 	MatInfo(int height, int width) : height(height), width(width) {}
 };
-
 
 class MPI_Wrapper{
 public:
@@ -102,9 +83,12 @@ public:
 };
 
 template<typename T>
-struct Mat {
+class Mat {
+private:
 	size_t width;
 	size_t height;
+	
+public:
 	T* ptr;
 	Mat() : height(0), width(0),ptr(nullptr){}
 	Mat(size_t height,size_t width) : ptr(nullptr){
@@ -131,6 +115,11 @@ struct Mat {
 				row[j] = mrow[j];
 		}
 	}
+
+	size_t getWidth()const{return width;}
+	size_t getHeight()const{return height;}
+	size_t getCount()const{return width * height;}
+	T*& getPtr(){return ptr;}
 	Mat(Mat& mat) : height(0), width(0),ptr(nullptr) {
 		copy(mat);
 	}
@@ -180,13 +169,13 @@ struct Mat {
 	}
 
 	friend ostream& operator << (ostream& s, Mat& mat) {
-		s << "Mat" << "<"<< typeid(T).name() << "> " << "(" << mat.height << "," << mat.width << ")" << endl;
-		T* row = nullptr;
-		for (size_t i = 0; i < mat.height; i++) {
-			row = mat.ptr + i * mat.width;
-			for (size_t j = 0; j < mat.width; j++)
+		s << "Mat" << "<"<< typeid(T).name() << "> " << "(" << mat.getHeight() << "," << mat.getWidth() << ")" << endl;
+		T* row = mat.getPtr();
+		for (size_t i = 0; i < mat.getHeight(); i++) {
+			for (size_t j = 0; j < mat.getWidth(); j++)
 				s << setw(10) << left << setprecision(3) << row[j] << " ";
 			s << endl;
+			row += mat.getWidth();
 		}
 		return s;
 	}
@@ -222,13 +211,15 @@ void sendMat(float* ptr, MatInfo& matInfo, MPI_Datatype matInfo_t, int src, int 
 	MPI_Send(ptr, matInfo.width * matInfo.height, MPI_FLOAT, src, tag, comm);
 }
 
-Mat<float> recvMat(int source, int tag, MPI_Comm comm, MPI_Datatype matInfo_t, MPI_Status& status){
+Mat<float> recvMat(int source, int tag, MPI_Comm comm, MPI_Datatype matInfo_t){
+	const int nCalls = 3;
+	MPI_Status statuses[nCalls];
 	MatInfo matInfo;
 	//MPI_Recv(&matInfo, 1, matInfo_t, source, tag, comm, &status);
-	MPI_Recv(&matInfo.height, 1, MPI_INT, source, tag, comm, &status);
-	MPI_Recv(&matInfo.width, 1, MPI_INT, source, tag, comm, &status);
+	MPI_Recv(&matInfo.height, 1, MPI_INT, source, tag, comm, &statuses[0]);
+	MPI_Recv(&matInfo.width, 1, MPI_INT, source, tag, comm, &statuses[1]);
 	Mat<float> mat(matInfo.height, matInfo.width);
-	MPI_Recv(mat.ptr, mat.height * mat.width, MPI_FLOAT,  source, tag, comm, &status);
+	MPI_Recv(mat.getPtr(), mat.getWidth() * mat.getHeight(), MPI_FLOAT,  source, tag, comm, &statuses[2]);
 	return mat;
 }
 
@@ -242,14 +233,14 @@ Mat<float> ribbonBlockingMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper& mp
 			//devide and send mat1
 			trMat2 = mat2.transpose();
 
-			partHeight = mat1.height / procCount;
-			int heightResidue = mat1.height % mpiWrap.getProcCount();
-			int partCount = partHeight * mat1.width;
+			partHeight = mat1.getHeight() / procCount;
+			int heightResidue = mat1.getHeight() % mpiWrap.getProcCount();
+			int partCount = partHeight * mat1.getWidth();
 
 			int ptrOffset = partCount;
 
-			MatInfo mat1Info(partHeight, mat1.width);
-			MatInfo mat2Info(trMat2.height, trMat2.width);
+			MatInfo mat1Info(partHeight, mat1.getWidth());
+			MatInfo mat2Info(trMat2.getHeight(), trMat2.getWidth());
 	
 			if(procCount > 1){
 				for(int i = 1;i < procCount;i++){
@@ -257,49 +248,146 @@ Mat<float> ribbonBlockingMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper& mp
 						//calc last portion
 						mat1Info.height += heightResidue;
 
-					sendMat(mat1.ptr + ptrOffset, mat1Info, mpiWrap.getMatInfo_t(), i, 0, MPI_COMM_WORLD);
-					sendMat(trMat2.ptr, mat2Info, mpiWrap.getMatInfo_t(), i, 0, MPI_COMM_WORLD);
+					sendMat(mat1.getPtr() + ptrOffset, mat1Info, mpiWrap.getMatInfo_t(), i, 0, MPI_COMM_WORLD);
+					sendMat(trMat2.getPtr(), mat2Info, mpiWrap.getMatInfo_t(), i, 0, MPI_COMM_WORLD);
 					ptrOffset += partCount;
 				}
 			}
 		}
 		else{
 			//get mat1 part
-			mat1 = recvMat(mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t(), status);
-			trMat2 = recvMat(mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t(), status);
-			partHeight = mat1.height;
+			mat1 = recvMat(mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t());
+			trMat2 = recvMat(mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t());
+			partHeight = mat1.getHeight();
 		}
 		//every node multiply his part
-		Mat<float> partResMat(partHeight, trMat2.height);
-		int trHeight = trMat2.height;
-		int width = mat1.width; 
-		float* partResRow = partResMat.ptr;  
-		float* tr2Row = trMat2.ptr;
-		float* mat1Row = mat1.ptr;
+		Mat<float> partResMat(partHeight, trMat2.getHeight());
+		int trHeight = trMat2.getHeight();
+		int width = mat1.getWidth(); 
+		float* partResRow = partResMat.getPtr();  
+		float* tr2Row = trMat2.getPtr();
+		float* mat1Row = mat1.getPtr();
 		for(int i = 0;i < partHeight;i++){
-			tr2Row = trMat2.ptr;
+			tr2Row = trMat2.getPtr();
 			for(int k = 0;k < trHeight;k++){
 				partResRow[k] = 0;
 				for(int j = 0;j < width;j++)
 					partResRow[k] += mat1Row[j] * tr2Row[j];
 				tr2Row += width;
 			}
-			partResRow += partResMat.width;
+			partResRow += partResMat.getWidth();
 			mat1Row += width;
 		}
 		
 		if(mpiWrap.isMaster()){
 			//gather results
-			resMat = Mat<float>(mat1.height, mat2.width);
-			memcpy(resMat.ptr, partResMat.ptr, sizeof(float) * partResMat.height * partResMat.width);
+			resMat = Mat<float>(mat1.getHeight(), mat2.getWidth());
+			memcpy(resMat.getPtr(), partResMat.getPtr(), sizeof(float) * partResMat.getHeight() * partResMat.getWidth());
 			for(int i = 1; i < procCount;i++){
-				partResMat = recvMat(MPI_ANY_SOURCE , MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t(), status);
-				memcpy(resMat.ptr + status.MPI_SOURCE * partHeight * partResMat.width, partResMat.ptr, sizeof(float) *  partResMat.height * partResMat.width);
+				partResMat = recvMat(MPI_ANY_SOURCE , MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t());
+				memcpy(resMat.getPtr() + status.MPI_SOURCE * partHeight * partResMat.getWidth(), partResMat.getPtr(), sizeof(float) *  partResMat.getHeight() * partResMat.getWidth());
 			}
 			//cout <<"result mat : "<< resMat << endl;
 		}else{
-			MatInfo matInfo(partResMat.height, partResMat.width);
-			sendMat(partResMat.ptr, matInfo, mpiWrap.getMatInfo_t(), mpiWrap.MASTER, 0, MPI_COMM_WORLD);
+			MatInfo matInfo(partResMat.getHeight(), partResMat.getWidth());
+			sendMat(partResMat.getPtr(), matInfo, mpiWrap.getMatInfo_t(), mpiWrap.MASTER, 0, MPI_COMM_WORLD);
+		}
+		return resMat;
+	}
+
+void sendMatAsync(float* ptr, MatInfo& matInfo, MPI_Datatype matInfo_t, int src, int tag, MPI_Comm comm){
+	const int nAsyncCalls = 3;
+	MPI_Request requests[nAsyncCalls];
+	MPI_Status statuses[nAsyncCalls];
+	//MPI_Isend(&matInfo, 1,  matInfo_t, src, tag, comm, &(requests[0]));
+	MPI_Isend(&matInfo.height, 1,  MPI_INT, src, tag, comm, &(requests[0]));
+	MPI_Isend(&matInfo.width, 1,  MPI_INT, src, tag, comm, &(requests[1]));
+	MPI_Isend(ptr, matInfo.width * matInfo.height, MPI_FLOAT, src, tag, comm, &(requests[2]));
+	//MPI_Waitall(nAsyncCalls, requests, statuses);
+}
+
+Mat<float> recvMatAsync(int source, int tag, MPI_Comm comm, MPI_Datatype matInfo_t){
+	MatInfo matInfo;
+	const int nAsyncCalls = 3;
+	MPI_Request requests[nAsyncCalls];
+	MPI_Status statuses[nAsyncCalls];
+	//MPI_Irecv(&matInfo, 1, matInfo_t, source, tag, comm, &(requests[0]));
+	MPI_Irecv(&matInfo.height, 1, MPI_INT, source, tag, comm, &(requests[0]));
+	MPI_Irecv(&matInfo.width, 1, MPI_INT, source, tag, comm,  &(requests[1]));
+	MPI_Waitall(2, requests, statuses);
+	Mat<float> mat(matInfo.height, matInfo.width);
+	MPI_Irecv(mat.getPtr(), mat.getCount(), MPI_FLOAT,  source, tag, comm, &(requests[2]));
+	MPI_Wait(&requests[2], &statuses[2]);
+	return mat;
+}
+
+
+Mat<float> ribbonNonBlockingMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper& mpiWrap){
+		int partHeight = 0;
+		int procCount = mpiWrap.getProcCount();
+		Mat<float> resMat;
+		Mat<float> trMat2;
+		MPI_Status status;
+		if(mpiWrap.isMaster()){
+			//devide and send mat1
+			trMat2 = mat2.transpose();
+
+			partHeight = mat1.getHeight() / procCount;
+			int heightResidue = mat1.getHeight() % mpiWrap.getProcCount();
+			int partCount = partHeight * mat1.getWidth();
+
+			int ptrOffset = partCount;
+
+			MatInfo mat1Info(partHeight, mat1.getWidth());
+			MatInfo mat2Info(trMat2.getHeight(), trMat2.getWidth());
+		
+			if(procCount > 1){
+				for(int i = 1;i < procCount;i++){
+					if(i == procCount - 1)
+						//calc last portion
+						mat1Info.height += heightResidue;
+					sendMatAsync(mat1.getPtr() + ptrOffset, mat1Info, mpiWrap.getMatInfo_t(), i, 0, MPI_COMM_WORLD);
+					sendMatAsync(trMat2.getPtr(), mat2Info, mpiWrap.getMatInfo_t(), i, 0, MPI_COMM_WORLD);
+					ptrOffset += partCount;
+				}
+			}
+		}
+		else{
+			mat1 = recvMat(mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t());
+			trMat2 = recvMat(mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t());
+			partHeight = mat1.getHeight();
+		}
+		//every node multiply his part
+		Mat<float> partResMat(partHeight, trMat2.getHeight());
+		int trHeight = trMat2.getHeight();
+		int width = mat1.getWidth(); 
+		float* partResRow = partResMat.getPtr();  
+		float* tr2Row = trMat2.getPtr();
+		float* mat1Row = mat1.getPtr();
+		for(int i = 0;i < partHeight;i++){
+			tr2Row = trMat2.getPtr();
+			for(int k = 0;k < trHeight;k++){
+				partResRow[k] = 0;
+				for(int j = 0;j < width;j++)
+					partResRow[k] += mat1Row[j] * tr2Row[j];
+				tr2Row += width;
+			}
+			partResRow += partResMat.getWidth();
+			mat1Row += width;
+		}
+		
+		if(mpiWrap.isMaster()){
+			//gather results
+			resMat = Mat<float>(mat1.getHeight(), mat2.getWidth());
+			memcpy(resMat.getPtr(), partResMat.getPtr(), sizeof(float) * partResMat.getHeight() * partResMat.getWidth());
+			for(int i = 1; i < procCount;i++){
+				partResMat = recvMat(MPI_ANY_SOURCE , MPI_ANY_TAG, MPI_COMM_WORLD, mpiWrap.getMatInfo_t());
+				memcpy(resMat.getPtr() + status.MPI_SOURCE * partHeight * partResMat.getWidth(), partResMat.getPtr(), sizeof(float) *  partResMat.getHeight() * partResMat.getWidth());
+			}
+			
+		}else{
+			MatInfo matInfo(partResMat.getHeight(), partResMat.getWidth());
+			sendMat(partResMat.getPtr(), matInfo, mpiWrap.getMatInfo_t(), mpiWrap.MASTER, 0, MPI_COMM_WORLD);
 		}
 		return resMat;
 	}
@@ -324,14 +412,52 @@ int main(int argc, char* argv[]){
 		
 		timer.start();
 	}
-
-	//MPI_Barrier(MPI_COMM_WORLD);
-
+	/*
+	if(mpiWrap.isMaster()){
+		MatInfo mi(mat1.getHeight(), mat1.getWidth());
+		for(int i = 1; i< mpiWrap.getProcCount();i++){
+			MPI_Status stat[2];
+			MPI_Request req[2];
+			int fl = 0;
+			MPI_Isend(& mi, 1, mpiWrap.getMatInfo_t(), i, 0, MPI_COMM_WORLD, &req[0]); 
+			MPI_Isend(mat1.getPtr(), mat1.getCount(), MPI_FLOAT, i, 0, MPI_COMM_WORLD, &req[1]);
+			//MPI_Waitall( 2, req, stat); 
+			//MPI_Wait(&req[0], &stat[0]);
+			cout << "after";
+		}
+	}
+	else{
+		MPI_Status stat[2];
+		MPI_Request req[2];
+		MatInfo mi;
+		MPI_Irecv(&mi, 1, mpiWrap.getMatInfo_t(), mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD,& req[0]); 
+		MPI_Wait(&req[0], &stat[0]);
+		Mat<float> mat(mi.height, mi.width);
+		cout << mat.getWidth() <<" "<< mat.getHeight() << endl;
+		MPI_Irecv(mat.getPtr(), mat.getCount(), MPI_FLOAT, mpiWrap.MASTER, MPI_ANY_TAG, MPI_COMM_WORLD,& req[1]);
+		MPI_Wait(&req[1], &stat[1]);
+		//MPI_Waitall( 2, req,stat); 
+		cout << "after ch";
+	}
+	*/
+	/*
+	
 	ribbonBlockingMul(mat1, mat2, mpiWrap);
+	
 	if(mpiWrap.isMaster()){
 		cout<<"mpi mult (" << m <<", " << n <<")" << "x" << "(" << n <<", "<<q <<") : " << timer.time_diff() << endl;
+		
+		timer.start();
+	}
+	*/
+	
+	ribbonNonBlockingMul(mat1, mat2, mpiWrap);
+
+	if(mpiWrap.isMaster()){
+		cout<<"mpi async mult (" << m <<", " << n <<")" << "x" << "(" << n <<", "<<q <<") : " << timer.time_diff() << endl;
 	}
 	
+
 	cout << endl;
 	system("pause");	
 }
