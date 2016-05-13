@@ -8,6 +8,7 @@
 #include <cassert>
 #include <string.h>
 #include "Timer.h"
+#include <fstream>
 
 using namespace std;
 
@@ -17,9 +18,10 @@ std::default_random_engine randGen;
 std::uniform_real_distribution<float> unifDistr(0.0, 1.0);
 
 //matrixes m * n , n * q
-const int m = 512;
-const int n = 64;
-const int q = 128;
+//512 * 64 * 128
+const int m = 7;
+const int n = 4;
+const int q = 8;
 
 struct MatInfo{
 	int width;
@@ -68,6 +70,7 @@ public:
 	~MPI_Wrapper(){
 		MPI_Finalize();
 	}
+	bool isLast()const{return rank == procCount - 1;}
 	bool isMaster(){return rank == MASTER;}
 	int getRank()const{return rank;}
 	int getProcCount()const{return procCount;}
@@ -97,6 +100,25 @@ public:
 		alloc(height, width);
 	}
 	~Mat() {release();}
+
+	void realloc(int h, int w){
+		T* oldPtr = ptr;
+		T* newPtr = new T[h* w];
+		T* newRow = newPtr;
+		T* oldRow = oldPtr;
+		for(int i = 0;i < height;i++){
+			for(int j = 0;j < w;j++)
+				newRow[j] = oldRow[j];
+			newRow += w;
+			oldRow += width;
+		}
+		this->height = h;
+		this->width = w;
+
+		delete[] oldPtr;
+		this->ptr = newPtr;
+	}
+
 	void copy(Mat& mat) {
 		if(this->width != mat.width || this->height != mat.height){
 			release();
@@ -159,6 +181,24 @@ public:
 		return tr_mat;
 	}
 
+	void align(int delim){
+		int residue = height %  delim;
+		int newHeight = 0;
+		if( residue != 0){
+			newHeight = height + delim - residue;
+			int oldHeight = height;
+			
+			realloc(newHeight, width);
+
+			T* row = nullptr;
+			for(int i = oldHeight;i < newHeight;i++){
+				row = ptr + i * width;
+				for(int j = 0;j < width;j++)
+					row[j] = 0;
+			}
+		}
+	}
+
 	void generateFloat() {
 		T* row = nullptr;
 		for (size_t i = 0; i < height; i++){
@@ -203,6 +243,7 @@ public:
 	}
 	
 };
+
 
 void sendMat(float* ptr, MatInfo& matInfo, MPI_Datatype matInfo_t, int src, int tag, MPI_Comm comm){
 	//MPI_Send(&matInfo, 1,  matInfo_t, src, tag, comm);
@@ -303,7 +344,7 @@ void sendMatAsync(float* ptr, MatInfo& matInfo, MPI_Datatype matInfo_t, int src,
 	MPI_Isend(&matInfo.height, 1,  MPI_INT, src, tag, comm, &(requests[0]));
 	MPI_Isend(&matInfo.width, 1,  MPI_INT, src, tag, comm, &(requests[1]));
 	MPI_Isend(ptr, matInfo.width * matInfo.height, MPI_FLOAT, src, tag, comm, &(requests[2]));
-	//MPI_Waitall(nAsyncCalls, requests, statuses);
+	MPI_Waitall(nAsyncCalls, requests, statuses);
 }
 
 Mat<float> recvMatAsync(int source, int tag, MPI_Comm comm, MPI_Datatype matInfo_t){
@@ -392,8 +433,10 @@ Mat<float> ribbonNonBlockingMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper&
 		return resMat;
 	}
 
-Mat<float> ribbonCollectiveMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper& mpiWrap){
+Mat<float> ribbonCollectiveMul(Mat<float> mat1, Mat<float> mat2, MPI_Wrapper& mpiWrap){
 		int procCount = mpiWrap.getProcCount();
+		int partHeight = 0;
+		int heightResidue = 0;
 		Mat<float> resMat;
 		Mat<float> trMat2;
 		MatInfo mat1Info;
@@ -403,32 +446,34 @@ Mat<float> ribbonCollectiveMul(Mat<float>& mat1, Mat<float>& mat2, MPI_Wrapper& 
 			//devide and send mat1
 			trMat2 = mat2.transpose();
 
-			int partHeight = mat1.getHeight() / procCount;
-			int heightResidue = mat1.getHeight() % mpiWrap.getProcCount();
+			mat1.align(procCount);
 			partCount = partHeight * mat1.getWidth();
 
-			mat1Info.height = partHeight;
+			mat1Info.height = mat1.getHeight() / procCount;
 			mat1Info.width = mat1.getWidth();
 
 			mat2Info.height =  trMat2.getHeight();
 			mat2Info.width =  trMat2.getWidth();
 		}
+
 		//bcast transposed mat
 		MPI_Bcast(& mat2Info, 1, mpiWrap.getMatInfo_t(), mpiWrap.MASTER, MPI_COMM_WORLD);
-		if( ! mpiWrap.isMaster())
+		if( mpiWrap.isMaster() != true )
 			trMat2 = Mat<float>(mat2Info.height, mat2Info.width);
 		MPI_Bcast(trMat2.getPtr() , trMat2.getCount(),MPI_FLOAT, mpiWrap.MASTER, MPI_COMM_WORLD);
 		
-		
+
 		MPI_Bcast(& mat1Info, 1, mpiWrap.getMatInfo_t(), mpiWrap.MASTER, MPI_COMM_WORLD);
-		if(! mpiWrap.isMaster())
+		if( ! mpiWrap.isMaster())
 			mat1 = Mat<float>(mat1Info.height, mat1Info.width);
-		if(mpiWrap.isMaster())
+		if(mpiWrap.isMaster()){
 			MPI_Scatter(mat1.getPtr(), mat1Info.height * mat1Info.width, MPI_FLOAT, MPI_IN_PLACE, mat1Info.height * mat1Info.width, MPI_FLOAT, mpiWrap.MASTER, MPI_COMM_WORLD);
-		else
+		}
+		else{
 			MPI_Scatter(NULL, mat1Info.height * mat1Info.width, MPI_FLOAT,mat1.getPtr(), mat1Info.height * mat1Info.width, MPI_FLOAT, mpiWrap.MASTER, MPI_COMM_WORLD);
+		}
 	//every node multiply his part
-		int partHeight = mat1Info.height;
+		partHeight = mat1Info.height;
 		Mat<float> partResMat(partHeight, trMat2.getHeight());
 		int trHeight = trMat2.getHeight();
 		int width = mat1.getWidth(); 
@@ -458,43 +503,70 @@ int main(int argc, char* argv[]){
 	MPI_Wrapper mpiWrap(&argc, &argv);
 	Mat<float> mat1;
 	Mat<float> mat2;
+	Mat<float> res;
 	Timer timer;
 	if(mpiWrap.isMaster())
 	{
 		mat1 = Mat<float>(m, n);
 		mat1.generateFloat();
-		//cout << "mat1" << mat1 << endl;
+		cout <<"mama1" << "mat1" << mat1 << endl;
 		mat2 = Mat<float>(n, q);
 		mat2.generateFloat();
-		//cout << "mat2" << mat2 << endl;
+		cout <<"mama2" <<"mat2" << mat2 << endl;
 
 		timer.start();
-		mat1.seqMul(mat2);
+		res = mat1.seqMul(mat2);
 		cout<<"sequential mult (" << m <<", " << n <<")" << "x" << "(" << n <<", "<<q <<") : " << timer.time_diff() << endl;
-		
+		//cout << res << endl;
+		/*
+		fstream file("sequential.txt");
+		file << res;
+		file.close();*/
 		timer.start();
 	}
-	
+	/*
 	ribbonBlockingMul(mat1, mat2, mpiWrap);
 	
 	if(mpiWrap.isMaster()){
 		cout<<"mpi blocking mult (" << m <<", " << n <<")" << "x" << "(" << n <<", "<<q <<") : " << timer.time_diff() << endl;
+		//cout << res << endl;
+		
+		//fstream file("blocking.txt");
+		//file << res;
+		//file.close();
+		
 		timer.start();
 	}
 	
-	ribbonNonBlockingMul(mat1, mat2, mpiWrap);
+	
+	res = ribbonNonBlockingMul(mat1, mat2, mpiWrap);
 
 	if(mpiWrap.isMaster()){
 		cout<<"mpi non-blocking mult (" << m <<", " << n <<")" << "x" << "(" << n <<", "<<q <<") : " << timer.time_diff() << endl;
+		//cout << res << endl;
+		
+		//fstream file("non_blocking.txt");
+		//file << res;
+		//file.close();
+		
 		timer.start();
 	}
-
-	ribbonCollectiveMul(mat1, mat2, mpiWrap);
-
+	*/
+	res = ribbonCollectiveMul(mat1, mat2, mpiWrap);
 	if(mpiWrap.isMaster()){
 		cout<<"mpi collective mult (" << m <<", " << n <<")" << "x" << "(" << n <<", "<<q <<") : " << timer.time_diff() << endl;
+		cout << res << endl;
+		
+		/*
+		fstream file("collective.txt", ios::trunc);
+		file << res;
+		file.close();
+		*/
 	}
-	
-	cout << endl;
-	system("pause");	
+
+
+	if(mpiWrap.isMaster()){
+		cout << endl;
+		system("pause");
+	}	
 }
